@@ -1,0 +1,162 @@
+name: Unit Tests
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The branch or tag to build
+        type: string
+        required: false
+
+      runner:
+        description: Imagen del runner donde se ejecutarán los jobs. Por ejemplo, `ubuntu-latest`.
+        type: string
+        default: ubuntu-latest
+        required: false
+
+      minimum_coverage: 
+        description: Porcentaje mínimo de cobertura de pruebas requerido para que la validación pase.
+        type: number
+        default: 80
+        required: false
+
+      eslint_config:
+        description: Ruta al archivo de configuración de ESLint que se usará para el análisis de código.
+        type: string
+        required: false
+        default: eslint.config.js
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  HUSKY: 0
+
+jobs:
+  secrets:
+    name: 🔒 Check Secrets
+    environment: test
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: 🛎 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - id: check
+        name: 🕵 Secret Scanning
+        uses: trufflesecurity/trufflehog@main
+        with:
+          head: ${{ github.ref_name }}
+          extra_args: --results=verified,unknown
+
+      - name: Report Status Failed
+        uses: marocchino/sticky-pull-request-comment@v2
+        if: ${{ steps.check.outputs.success == 'false' }}
+        with:
+          header: 'Credenciales expuestas en este PR'
+          recreate: true
+          message: |
+              ### 🚨 Vulnerabilidad detectada
+              Se han detectado credenciales expuestas en este PR. Por favor, revisa y elimina cualquier información sensible antes de continuar.
+
+  depcheck:
+    name: 📦 Analyze Dependencies
+    environment: test
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: 🛎 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: 🕵 Check Dependencies
+        uses: tubone24/depcheck_action@v1.2.0
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_COMMENT_URL: ${{ github.event.pull_request.comments_url }}
+
+  coverage:
+    name: 📊 Generate Test Coverage Report
+    environment: test
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: 🛎 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      
+      # Setup LCOV CLI
+      - name: 📦 Setup LCOV
+        uses: hrishikesh-kadam/setup-lcov@v1
+
+      # Setup Node.js environment
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      
+      - name: 📦 Setup Config
+        continue-on-error: true
+        run: |
+          npm pkg delete c8
+
+          if [[ -f "package.json" ]] && grep -q '"express"' package.json; then
+            cat > .c8rc <<EOF
+            {
+              "exclude": [
+                "*.config.*",
+                "**/index.js",
+                "src/app.js",
+                "src/routes/**",
+                "src/config/**"
+              ],
+              "include": ["src/", "lib/"],
+              "reporter": ["text", "html", "lcov"],
+              "all": true,
+              "check-coverage": true,
+              "branches": 0,
+              "functions": 0,
+              "lines": 0,
+              "statements": 0
+            }
+            EOF
+          fi
+
+      # Install dependencies
+      - name: 📥 Install dependencies
+        run: | 
+          # Create .npmrc file
+          echo "ignore-scripts=true" >> .npmrc
+          npm ci
+
+      - name: 🕵 Run Linter
+        uses: tj-actions/eslint-changed-files@v25
+        with:
+          config_path: ${{ inputs.eslint_config }}
+          extra_args: "--max-warnings=0 --no-inline-config --report-unused-disable-directives --no-warn-ignored"
+          
+      - name: 🧪 Run tests with coverage
+        run: node --run test:coverage
+
+      - name: 🤖 Report code coverage
+        uses: zgosalvez/github-actions-report-lcov@v4
+        with:
+          coverage-files: coverage/lcov.info
+          minimum-coverage: ${{ inputs.minimum_coverage }}
+          artifact-name: coverage-report
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          update-comment: true
+        env:
+          MINIMUM_COVERAGE: ${{ inputs.minimum_coverage }}
